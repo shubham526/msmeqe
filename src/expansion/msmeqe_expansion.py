@@ -1,3 +1,5 @@
+# src/expansion/msmeqe_expansion.py
+
 """
 msmeqe/expansion/msmeqe_expansion.py
 
@@ -6,7 +8,7 @@ Core MS-MEQE expansion model.
 Implements the pipeline described in the methodology section:
 
   - Takes multi-source candidate terms (docs / KB / embeddings)
-  - Computes value and weight feature vectors
+  - Computes value and weight feature vectors using FeatureExtractor
   - Predicts per-term value and weight using trained models
   - Predicts a query-specific expansion budget
   - Solves an unbounded knapsack to select term frequencies
@@ -14,6 +16,7 @@ Implements the pipeline described in the methodology section:
 
 Dependencies:
   - msmeqe.reranking.semantic_encoder.SemanticEncoder
+  - msmeqe.features.feature_extraction.FeatureExtractor
   - Regressor objects for value, weight, and budget (with .predict)
 """
 
@@ -26,6 +29,7 @@ from typing import List, Dict, Optional, Tuple
 import numpy as np
 
 from msmeqe.reranking.semantic_encoder import SemanticEncoder
+from msmeqe.features.feature_extraction import FeatureExtractor, create_candidate_stats_dict
 
 logger = logging.getLogger(__name__)
 
@@ -96,6 +100,7 @@ class MSMEQEExpansionModel:
 
     Assumes:
       - A Sentence-BERT encoder (SemanticEncoder) for embeddings
+      - FeatureExtractor for computing features
       - Pretrained regressors for value, weight, and budget
       - Candidates passed in as CandidateTerm instances
       - Pseudo-relevant document centroid embedding is provided (or None)
@@ -103,19 +108,21 @@ class MSMEQEExpansionModel:
     Typical usage:
 
         from msmeqe.reranking.semantic_encoder import SemanticEncoder
+        from msmeqe.features.feature_extraction import FeatureExtractor
         from msmeqe.expansion.msmeqe_expansion import MSMEQEExpansionModel, CandidateTerm
 
         encoder = SemanticEncoder(model_name="sentence-transformers/all-MiniLM-L6-v2")
+        feature_extractor = FeatureExtractor(collection_size=N_docs)
         value_model = joblib.load("value_model.pkl")
         weight_model = joblib.load("weight_model.pkl")
         budget_model = joblib.load("budget_model.pkl")
 
         msmeqe = MSMEQEExpansionModel(
             encoder=encoder,
+            feature_extractor=feature_extractor,
             value_model=value_model,
             weight_model=weight_model,
             budget_model=budget_model,
-            collection_size=N_docs,
             lambda_interp=0.3,
         )
 
@@ -128,33 +135,33 @@ class MSMEQEExpansionModel:
     """
 
     def __init__(
-        self,
-        encoder: SemanticEncoder,
-        value_model,
-        weight_model,
-        budget_model,
-        collection_size: int,
-        lambda_interp: float = 0.3,
-        min_budget: int = 20,
-        max_budget: int = 80,
-        budget_step: int = 5,
+            self,
+            encoder: SemanticEncoder,
+            feature_extractor: FeatureExtractor,
+            value_model,
+            weight_model,
+            budget_model,
+            lambda_interp: float = 0.3,
+            min_budget: int = 20,
+            max_budget: int = 80,
+            budget_step: int = 5,
     ) -> None:
         """
         Args:
             encoder: SemanticEncoder instance (Sentence-BERT wrapper)
+            feature_extractor: FeatureExtractor instance
             value_model: regressor with .predict(X) → values
             weight_model: regressor with .predict(X) → weights
             budget_model: regressor with .predict(X_query_features) → budget
-            collection_size: total number of documents N
             lambda_interp: interpolation parameter λ in final query embedding
             min_budget, max_budget, budget_step: budget range & discretization
         """
         self.encoder = encoder
+        self.feature_extractor = feature_extractor
         self.value_model = value_model
         self.weight_model = weight_model
         self.budget_model = budget_model
 
-        self.N = int(collection_size)
         self.lambda_interp = float(lambda_interp)
 
         self.min_budget = int(min_budget)
@@ -169,8 +176,7 @@ class MSMEQEExpansionModel:
             raise ValueError("budget_step must be positive")
 
         logger.info(
-            "Initialized MSMEQEExpansionModel: N=%d, λ=%.3f, budget=[%d,%d], step=%d",
-            self.N,
+            "Initialized MSMEQEExpansionModel: λ=%.3f, budget=[%d,%d], step=%d",
             self.lambda_interp,
             self.min_budget,
             self.max_budget,
@@ -182,11 +188,11 @@ class MSMEQEExpansionModel:
     # ------------------------------------------------------------------
 
     def expand(
-        self,
-        query_text: str,
-        candidates: List[CandidateTerm],
-        pseudo_doc_centroid: Optional[np.ndarray],
-        query_stats: Dict[str, float],
+            self,
+            query_text: str,
+            candidates: List[CandidateTerm],
+            pseudo_doc_centroid: Optional[np.ndarray],
+            query_stats: Dict[str, float],
     ) -> Tuple[List[SelectedTerm], np.ndarray]:
         """
         Run full MS-MEQE for one query.
@@ -226,9 +232,9 @@ class MSMEQEExpansionModel:
         term_strings = [c.term for c in candidates]
         term_embs = self.encoder.encode(term_strings)  # (m, d)
 
-        # Build features
-        logger.debug("MSMEQE: building value feature matrix")
-        X_val = self._build_value_feature_matrix(
+        # Build features using FeatureExtractor
+        logger.debug("MSMEQE: extracting value features")
+        X_val = self._build_value_features(
             query_text=query_text,
             query_embedding=q_emb,
             pseudo_centroid=pseudo_doc_centroid,
@@ -236,8 +242,9 @@ class MSMEQEExpansionModel:
             term_embeddings=term_embs,
         )
 
-        logger.debug("MSMEQE: building weight feature matrix")
-        X_wt = self._build_weight_feature_matrix(
+        logger.debug("MSMEQE: extracting weight features")
+        X_wt = self._build_weight_features(
+            query_text=query_text,
             query_embedding=q_emb,
             candidates=candidates,
             term_embeddings=term_embs,
@@ -247,7 +254,7 @@ class MSMEQEExpansionModel:
         logger.debug("MSMEQE: predicting values and weights")
         v_pred = self._predict_values(X_val)  # (m,)
         w_pred = self._predict_weights(X_wt)  # (m,)
-        w_pred = np.maximum(w_pred, 1e-6)     # ensure non-negative / non-zero
+        w_pred = np.maximum(w_pred, 1e-6)  # ensure non-negative / non-zero
 
         # Predict budget
         logger.debug("MSMEQE: predicting budget")
@@ -290,200 +297,98 @@ class MSMEQEExpansionModel:
         return selected_terms, q_star
 
     # ------------------------------------------------------------------
-    # Feature extraction
+    # Feature extraction (using FeatureExtractor)
     # ------------------------------------------------------------------
 
-    def _build_value_feature_matrix(
-        self,
-        query_text: str,
-        query_embedding: np.ndarray,
-        pseudo_centroid: Optional[np.ndarray],
-        candidates: List[CandidateTerm],
-        term_embeddings: np.ndarray,
+    def _build_value_features(
+            self,
+            query_text: str,
+            query_embedding: np.ndarray,
+            pseudo_centroid: Optional[np.ndarray],
+            candidates: List[CandidateTerm],
+            term_embeddings: np.ndarray,
     ) -> np.ndarray:
         """
-        Build value feature matrix (m x d_features) for candidates.
+        Build value feature matrix using FeatureExtractor.
 
-        Features (simplified but aligned with the paper):
-
-          Semantic (SBERT):
-            - cos_sim_q: cosine(term_emb, q_emb)
-            - cos_sim_pseudo: cosine(term_emb, pseudo_centroid) or 0 if None
-            - l2_dist_q: ||term_emb - q_emb||_2
-
-          Statistical:
-            - idf = log(N / df)
-            - tf_pseudo
-            - rm3_score
-            - coverage_pseudo
-
-          Query-term interaction:
-            - in_query: 1 if term appears in query text (whole-word match)
-
-          Source-specific:
-            - source_docs, source_kb, source_emb (one-hot)
-            - native_rank_norm
-            - native_score
+        Returns:
+            Feature matrix of shape (m, 18)
         """
         m = len(candidates)
         if m == 0:
-            return np.zeros((0, 1), dtype=np.float32)
+            return np.zeros((0, 18), dtype=np.float32)
 
-        def _normalize(x: np.ndarray) -> np.ndarray:
-            norms = np.linalg.norm(x, axis=-1, keepdims=True) + 1e-12
-            return x / norms
+        # Prepare candidate tuples for batch extraction
+        candidate_tuples = [
+            (
+                c.term,
+                c.source,
+                create_candidate_stats_dict(
+                    rm3_score=c.rm3_score,
+                    tf_pseudo=c.tf_pseudo,
+                    coverage_pseudo=c.coverage_pseudo,
+                    df=c.df,
+                    cf=c.cf,
+                    native_rank=c.native_rank,
+                    native_score=c.native_score,
+                )
+            )
+            for c in candidates
+        ]
 
-        # Normalize embeddings
-        q_norm = _normalize(query_embedding[None, :])[0]          # (d,)
-        t_norm = _normalize(term_embeddings)                      # (m, d)
-
-        # Cosine similarities and distances
-        cos_sim_q = np.sum(t_norm * q_norm[None, :], axis=1)      # (m,)
-        l2_dist_q = np.linalg.norm(term_embeddings - q_norm[None, :], axis=1)
-
-        if pseudo_centroid is not None:
-            p_norm = _normalize(pseudo_centroid[None, :])[0]
-            cos_sim_pseudo = np.sum(t_norm * p_norm[None, :], axis=1)
-        else:
-            cos_sim_pseudo = np.zeros(m, dtype=np.float32)
-
-        # Basic stats
-        df = np.array([max(c.df, 1) for c in candidates], dtype=np.float32)
-        idf = np.log(self.N / df)
-
-        tf_pseudo = np.array([c.tf_pseudo for c in candidates], dtype=np.float32)
-        rm3 = np.array([c.rm3_score for c in candidates], dtype=np.float32)
-        coverage = np.array([c.coverage_pseudo for c in candidates], dtype=np.float32)
-
-        # Query-term interaction: simple whole-word lexical match
-        q_lower = " " + query_text.lower() + " "
-        in_query = np.array(
-            [
-                1.0 if f" {c.term.lower()} " in q_lower else 0.0
-                for c in candidates
-            ],
-            dtype=np.float32,
+        # Use FeatureExtractor's batch method
+        features = self.feature_extractor.extract_value_features_batch(
+            candidates=candidate_tuples,
+            query_text=query_text,
+            query_embedding=query_embedding,
+            term_embeddings=term_embeddings,
+            pseudo_centroid=pseudo_centroid,
         )
-
-        # Source one-hot
-        source_docs = np.array(
-            [1.0 if c.source == "docs" else 0.0 for c in candidates],
-            dtype=np.float32,
-        )
-        source_kb = np.array(
-            [1.0 if c.source == "kb" else 0.0 for c in candidates],
-            dtype=np.float32,
-        )
-        source_emb = np.array(
-            [1.0 if c.source == "emb" else 0.0 for c in candidates],
-            dtype=np.float32,
-        )
-
-        native_rank = np.array([float(c.native_rank) for c in candidates], dtype=np.float32)
-        native_score = np.array([c.native_score for c in candidates], dtype=np.float32)
-
-        max_rank = np.max(native_rank) if np.max(native_rank) > 0 else 1.0
-        native_rank_norm = native_rank / max_rank
-
-        features = np.stack(
-            [
-                cos_sim_q,
-                cos_sim_pseudo,
-                l2_dist_q,
-                idf,
-                tf_pseudo,
-                rm3,
-                coverage,
-                in_query,
-                source_docs,
-                source_kb,
-                source_emb,
-                native_rank_norm,
-                native_score,
-            ],
-            axis=1,
-        ).astype(np.float32)
 
         return features
 
-    def _build_weight_feature_matrix(
-        self,
-        query_embedding: np.ndarray,
-        candidates: List[CandidateTerm],
-        term_embeddings: np.ndarray,
+    def _build_weight_features(
+            self,
+            query_text: str,
+            query_embedding: np.ndarray,
+            candidates: List[CandidateTerm],
+            term_embeddings: np.ndarray,
     ) -> np.ndarray:
         """
-        Build weight feature matrix, focusing on drift/ambiguity risk.
+        Build weight feature matrix using FeatureExtractor.
 
-        Features:
-
-          Drift:
-            - cos_sim_q
-            - l2_dist_q
-
-          Ambiguity:
-            - df_norm = df / N
-            - idf (low idf = more ambiguous)
-            - coverage_pseudo
-
-          Source risk:
-            - source_docs, source_kb, source_emb
-            - native_rank_norm
-            - native_score
+        Returns:
+            Feature matrix of shape (m, 20)
         """
         m = len(candidates)
         if m == 0:
-            return np.zeros((0, 1), dtype=np.float32)
+            return np.zeros((0, 20), dtype=np.float32)
 
-        def _normalize(x: np.ndarray) -> np.ndarray:
-            norms = np.linalg.norm(x, axis=-1, keepdims=True) + 1e-12
-            return x / norms
+        # Prepare candidate tuples
+        candidate_tuples = [
+            (
+                c.term,
+                c.source,
+                create_candidate_stats_dict(
+                    rm3_score=c.rm3_score,
+                    tf_pseudo=c.tf_pseudo,
+                    coverage_pseudo=c.coverage_pseudo,
+                    df=c.df,
+                    cf=c.cf,
+                    native_rank=c.native_rank,
+                    native_score=c.native_score,
+                )
+            )
+            for c in candidates
+        ]
 
-        q_norm = _normalize(query_embedding[None, :])[0]
-        t_norm = _normalize(term_embeddings)
-
-        cos_sim_q = np.sum(t_norm * q_norm[None, :], axis=1)
-        l2_dist_q = np.linalg.norm(term_embeddings - q_norm[None, :], axis=1)
-
-        df = np.array([max(c.df, 1) for c in candidates], dtype=np.float32)
-        df_norm = df / float(self.N)
-        idf = np.log(self.N / df)
-        coverage = np.array([c.coverage_pseudo for c in candidates], dtype=np.float32)
-
-        source_docs = np.array(
-            [1.0 if c.source == "docs" else 0.0 for c in candidates],
-            dtype=np.float32,
+        # Use FeatureExtractor's batch method
+        features = self.feature_extractor.extract_weight_features_batch(
+            candidates=candidate_tuples,
+            query_text=query_text,
+            query_embedding=query_embedding,
+            term_embeddings=term_embeddings,
         )
-        source_kb = np.array(
-            [1.0 if c.source == "kb" else 0.0 for c in candidates],
-            dtype=np.float32,
-        )
-        source_emb = np.array(
-            [1.0 if c.source == "emb" else 0.0 for c in candidates],
-            dtype=np.float32,
-        )
-
-        native_rank = np.array([float(c.native_rank) for c in candidates], dtype=np.float32)
-        native_score = np.array([c.native_score for c in candidates], dtype=np.float32)
-
-        max_rank = np.max(native_rank) if np.max(native_rank) > 0 else 1.0
-        native_rank_norm = native_rank / max_rank
-
-        features = np.stack(
-            [
-                cos_sim_q,
-                l2_dist_q,
-                df_norm,
-                idf,
-                coverage,
-                source_docs,
-                source_kb,
-                source_emb,
-                native_rank_norm,
-                native_score,
-            ],
-            axis=1,
-        ).astype(np.float32)
 
         return features
 
@@ -522,27 +427,13 @@ class MSMEQEExpansionModel:
         Returns:
             Integer budget in [min_budget, max_budget] snapped to nearest budget_step.
         """
-        q_type = str(query_stats.get("q_type", "informational")).lower()
-        type_nav = 1.0 if q_type == "navigational" else 0.0
-        type_tran = 1.0 if q_type == "transactional" else 0.0
-        type_info = 1.0 if q_type == "informational" else 0.0
+        # Extract query features using FeatureExtractor
+        x_vec = self.feature_extractor.extract_query_features(
+            query_text="",  # Not used in query feature extraction
+            query_stats=query_stats,
+        )
 
-        x_vec = np.array(
-            [
-                float(query_stats.get("clarity", 0.0)),
-                float(query_stats.get("entropy", 0.0)),
-                float(query_stats.get("avg_idf", 0.0)),
-                float(query_stats.get("max_idf", 0.0)),
-                float(query_stats.get("avg_bm25", 0.0)),
-                float(query_stats.get("var_bm25", 0.0)),
-                float(query_stats.get("q_len", 0)),
-                type_nav,
-                type_info,
-                type_tran,
-            ],
-            dtype=np.float32,
-        ).reshape(1, -1)
-
+        x_vec = x_vec.reshape(1, -1)
         budget_pred = float(self.budget_model.predict(x_vec)[0])
 
         # Clip and snap to nearest step
@@ -562,10 +453,10 @@ class MSMEQEExpansionModel:
     # ------------------------------------------------------------------
 
     def _solve_unbounded_knapsack(
-        self,
-        values: np.ndarray,
-        weights: np.ndarray,
-        budget: int,
+            self,
+            values: np.ndarray,
+            weights: np.ndarray,
+            budget: int,
     ) -> np.ndarray:
         """
         Unbounded knapsack DP:
@@ -622,11 +513,11 @@ class MSMEQEExpansionModel:
     # ------------------------------------------------------------------
 
     def _build_enhanced_query_embedding(
-        self,
-        query_embedding: np.ndarray,
-        term_embeddings: np.ndarray,
-        values: np.ndarray,
-        counts: np.ndarray,
+            self,
+            query_embedding: np.ndarray,
+            term_embeddings: np.ndarray,
+            values: np.ndarray,
+            counts: np.ndarray,
     ) -> np.ndarray:
         """
         Build magnitude-encoded enhanced query embedding:
