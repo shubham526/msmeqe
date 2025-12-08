@@ -41,6 +41,8 @@ Usage:
 
 import logging
 import argparse
+import sys
+import os
 from pathlib import Path
 from typing import List, Optional, Set
 import pickle
@@ -49,9 +51,9 @@ from tqdm import tqdm
 
 import numpy as np
 
-from msmeqe.reranking.semantic_encoder import SemanticEncoder
-from msmeqe.expansion.embedding_candidates import VocabularyEmbeddings
-from msmeqe.utils.lucene_utils import get_lucene_classes
+from src.reranking.semantic_encoder import SemanticEncoder
+from src.expansion.embedding_candidates import VocabularyEmbeddings
+from src.utils.lucene_utils import get_lucene_classes
 
 logger = logging.getLogger(__name__)
 
@@ -229,7 +231,22 @@ class VocabularyBuilder:
         count = 0
         while terms_enum.next():
             term_bytes = terms_enum.term()
-            term_text = term_bytes.utf8ToString()
+            try:
+                term_text = term_bytes.utf8ToString()
+
+                # FIX: Handle multi-word terms typically stored with underscores
+                # e.g., "neural_network" -> "neural network"
+                if '_' in term_text:
+                    term_text = term_text.replace('_', ' ')
+
+                term_text = term_text.strip()
+                if not term_text:
+                    continue
+
+            except Exception as e:
+                # Skip invalid utf-8 sequences
+                continue
+
             df = terms_enum.docFreq()
 
             if min_df <= df <= max_df:

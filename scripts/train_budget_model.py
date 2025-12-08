@@ -43,14 +43,14 @@ from tqdm import tqdm
 import json
 import pickle
 
-from msmeqe.reranking.semantic_encoder import SemanticEncoder
-from msmeqe.features.feature_extraction import FeatureExtractor
-from msmeqe.expansion.candidate_extraction_pipeline import MultiSourceCandidateExtractor
-from msmeqe.expansion.msmeqe_expansion import MSMEQEExpansionModel
-from msmeqe.expansion.kb_expansion import KBCandidateExtractor
-from msmeqe.expansion.embedding_candidates import EmbeddingCandidateExtractor
-from msmeqe.retrieval.evaluator import TRECEvaluator
-from msmeqe.utils.file_utils import load_json, load_qrels
+from src.reranking.semantic_encoder import SemanticEncoder
+from src.features.feature_extraction import FeatureExtractor
+from src.expansion.candidate_extraction_pipeline import MultiSourceCandidateExtractor
+from src.expansion.msmeqe_expansion import MSMEQEExpansionModel
+from src.expansion.kb_expansion import KBCandidateExtractor
+from src.expansion.embedding_candidates import EmbeddingCandidateExtractor
+from src.retrieval.evaluator import TRECEvaluator
+from src.utils.file_utils import load_json, load_qrels
 
 logger = logging.getLogger(__name__)
 
@@ -69,7 +69,6 @@ class BudgetTrainingDataGenerator:
     def __init__(
             self,
             encoder: SemanticEncoder,
-            feature_extractor: FeatureExtractor,
             candidate_extractor: MultiSourceCandidateExtractor,
             value_model,
             weight_model,
@@ -91,7 +90,7 @@ class BudgetTrainingDataGenerator:
             collection_size: Number of documents in collection
         """
         self.encoder = encoder
-        self.feature_extractor = feature_extractor
+        self.collection_size = collection_size
         self.candidate_extractor = candidate_extractor
         self.value_model = value_model
         self.weight_model = weight_model
@@ -108,10 +107,10 @@ class BudgetTrainingDataGenerator:
         for budget in self.budget_options:
             self.msmeqe_models[budget] = MSMEQEExpansionModel(
                 encoder=encoder,
-                feature_extractor=feature_extractor,
                 value_model=value_model,
                 weight_model=weight_model,
                 budget_model=None,  # We're training this!
+                collection_size=self.collection_size,
                 lambda_interp=0.3,
                 min_budget=budget,
                 max_budget=budget,

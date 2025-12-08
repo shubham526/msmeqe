@@ -20,13 +20,15 @@ Usage:
 
 import logging
 import argparse
+import sys
 from pathlib import Path
 import numpy as np
 import json
 from tqdm import tqdm
 import ir_datasets
 
-from msmeqe.reranking.semantic_encoder import SemanticEncoder
+
+from src.reranking.semantic_encoder import SemanticEncoder
 
 logger = logging.getLogger(__name__)
 
@@ -104,6 +106,20 @@ def precompute_document_embeddings(
     logger.info("Concatenating embeddings...")
     doc_embeddings = np.vstack(all_embeddings)
 
+    # === VALIDATION: Ensure Data Consistency ===
+    logger.info("Validating embedding count against document IDs...")
+    if doc_embeddings.shape[0] != len(doc_ids):
+        error_msg = (
+            f"CRITICAL ERROR: Data Mismatch! "
+            f"Generated {doc_embeddings.shape[0]} embeddings but tracked {len(doc_ids)} IDs. "
+            f"Files will NOT be saved to prevent corruption."
+        )
+        logger.error(error_msg)
+        raise ValueError(error_msg)
+
+    logger.info(f"Validation PASSED: {len(doc_ids)} documents encoded successfully.")
+    # ===========================================
+
     logger.info(f"Encoded {len(doc_ids)} documents, embedding shape: {doc_embeddings.shape}")
 
     # Normalize embeddings (for cosine similarity)
@@ -133,6 +149,9 @@ def main():
     parser = argparse.ArgumentParser(description="Precompute document embeddings")
     parser.add_argument("--collection", type=str, required=True,
                         help="IR dataset collection name")
+    # Note: index-path arg is kept for compatibility but output-dir dictates save location
+    parser.add_argument("--index-path", type=str, required=False,
+                        help="Path to Lucene index (optional/unused in this script)")
     parser.add_argument("--output-dir", type=str, required=True,
                         help="Output directory for embeddings")
     parser.add_argument("--model-name", type=str,

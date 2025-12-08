@@ -32,18 +32,14 @@ Usage:
 
     # Compute query stats
     query_stats = extractor.compute_query_stats("neural networks")
-
-    # Compute pseudo-doc centroid
-    centroid = extractor.compute_pseudo_centroid("neural networks")
 """
 
 from __future__ import annotations
 
 import logging
-from typing import List, Dict, Optional, Tuple
+from typing import List, Dict, Optional, Tuple, Any
 from collections import Counter
 import re
-
 import numpy as np
 
 from src.expansion.rm_expansion import LuceneRM3Scorer
@@ -59,17 +55,6 @@ logger = logging.getLogger(__name__)
 class MultiSourceCandidateExtractor:
     """
     Extract candidates from all three sources with complete statistics.
-
-    This is the bridge between:
-      1. Source-specific extractors (RM3, KB, Embeddings)
-      2. MS-MEQE expansion model (which needs CandidateTerm objects)
-
-    Extracts candidates with:
-      - RM3 scores (for docs source)
-      - Entity linking confidence (for KB source)
-      - Cosine similarity (for embedding source)
-      - Term statistics: DF, CF (from Lucene index)
-      - Pseudo-doc statistics: TF, coverage
     """
 
     def __init__(
@@ -85,16 +70,6 @@ class MultiSourceCandidateExtractor:
     ):
         """
         Initialize multi-source extractor.
-
-        Args:
-            index_path: Path to Lucene index (for RM3 and term stats)
-            encoder: SemanticEncoder for embeddings
-            kb_extractor: Optional KBCandidateExtractor
-            emb_extractor: Optional EmbeddingCandidateExtractor
-            n_docs_rm3: Number of RM3 terms
-            n_kb: Number of KB terms
-            n_emb: Number of embedding terms
-            n_pseudo_docs: Number of pseudo-relevant documents
         """
         self.encoder = encoder
         self.index_path = index_path
@@ -164,29 +139,28 @@ class MultiSourceCandidateExtractor:
             self,
             query_text: str,
             query_id: Optional[str] = None,
-            kb_override: Optional[List[Dict]] = None,  # ← ADD THIS PARAMETER
+            kb_override: Optional[List[Dict]] = None,
     ) -> List[CandidateTerm]:
         """
         Extract candidates from all sources with complete statistics.
 
-        Args:
-            query_text: Query string
-            query_id: Optional query ID (for KB lookup)
-            kb_override: Optional precomputed KB candidates (skips KB extraction)
-                        List of dicts with keys: 'term', 'confidence', 'rank'
-
-        Returns:
-            List of CandidateTerm objects with all fields populated
+        Optimized to pre-tokenize pseudo-documents once to avoid overhead during
+        individual term statistics calculation.
         """
         all_candidates = []
 
-        # Get pseudo-relevant documents (shared across all sources)
-        pseudo_docs = self._get_pseudo_relevant_docs(query_text, self.n_pseudo_docs)
+        # 1. Retrieve pseudo-relevant documents once (shared across calculations)
+        # Returns (list of text, list of tokenized lists)
+        pseudo_docs, pseudo_docs_tokens = self._get_pseudo_relevant_docs_and_tokens(
+            query_text, self.n_pseudo_docs
+        )
 
         # === 1. DOCS SOURCE (RM3) ===
         logger.debug(f"Extracting RM3 candidates for: {query_text[:50]}")
 
         try:
+            # We assume RM3 scorer handles its own retrieval internally for the model,
+            # though ideally we would pass the retrieved docs to it to save compute.
             rm3_terms = self.rm3_scorer.expand(
                 query_str=query_text,
                 n_docs=self.n_pseudo_docs,
@@ -196,8 +170,9 @@ class MultiSourceCandidateExtractor:
 
             for rank, (term, rm3_score) in enumerate(rm3_terms, start=1):
                 df, cf = self._get_term_stats(term)
-                tf_pseudo = self._compute_tf_pseudo(term, pseudo_docs)
-                coverage = self._compute_coverage(term, pseudo_docs)
+                # Use pre-tokenized docs for efficiency
+                tf_pseudo = self._compute_tf_pseudo_optimized(term, pseudo_docs_tokens)
+                coverage = self._compute_coverage_optimized(term, pseudo_docs)
 
                 all_candidates.append(CandidateTerm(
                     term=term,
@@ -222,10 +197,15 @@ class MultiSourceCandidateExtractor:
             logger.debug(f"Using {len(kb_override)} precomputed KB candidates")
 
             try:
-                for kb_cand_dict in kb_override[:self.n_kb]:
-                    term = kb_cand_dict['term']
+                for rank, kb_cand_dict in enumerate(kb_override[:self.n_kb], start=1):
+                    # Validation: Ensure required keys exist
+                    term = kb_cand_dict.get('term')
+                    if not term:
+                        continue
+
                     confidence = kb_cand_dict.get('confidence', 1.0)
-                    rank = kb_cand_dict.get('rank', 1)
+                    # Use provided rank if available, else enumeration
+                    cand_rank = kb_cand_dict.get('rank', rank)
 
                     df, cf = self._get_term_stats(term)
 
@@ -237,19 +217,15 @@ class MultiSourceCandidateExtractor:
                         coverage_pseudo=0.0,
                         df=df,
                         cf=cf,
-                        native_rank=rank,
+                        native_rank=cand_rank,
                         native_score=confidence,
                     ))
-
-                logger.debug(f"Added {len(kb_override[:self.n_kb])} precomputed KB candidates")
-
             except Exception as e:
                 logger.warning(f"Failed to process precomputed KB candidates: {e}")
 
         elif self.kb_extractor:
             # Extract KB candidates on-the-fly (original behavior)
             logger.debug(f"Extracting KB candidates on-the-fly")
-
             try:
                 kb_candidates = self.kb_extractor.extract_candidates_with_metadata(
                     query_text=query_text,
@@ -258,7 +234,6 @@ class MultiSourceCandidateExtractor:
 
                 for rank, kb_cand in enumerate(kb_candidates[:self.n_kb], start=1):
                     df, cf = self._get_term_stats(kb_cand.term)
-
                     all_candidates.append(CandidateTerm(
                         term=kb_cand.term,
                         source="kb",
@@ -270,16 +245,13 @@ class MultiSourceCandidateExtractor:
                         native_rank=rank,
                         native_score=kb_cand.confidence,
                     ))
-
                 logger.debug(f"Extracted {len(kb_candidates)} KB candidates")
-
             except Exception as e:
                 logger.warning(f"KB extraction failed: {e}")
 
         # === 3. EMBEDDING SOURCE ===
         if self.emb_extractor:
             logger.debug(f"Extracting embedding candidates for: {query_text[:50]}")
-
             try:
                 emb_candidates = self.emb_extractor.extract_candidates(
                     query_text=query_text,
@@ -288,7 +260,6 @@ class MultiSourceCandidateExtractor:
 
                 for rank, (term, cos_sim) in enumerate(emb_candidates, start=1):
                     df, cf = self._get_term_stats(term)
-
                     all_candidates.append(CandidateTerm(
                         term=term,
                         source="emb",
@@ -300,63 +271,65 @@ class MultiSourceCandidateExtractor:
                         native_rank=rank,
                         native_score=cos_sim,
                     ))
-
                 logger.debug(f"Extracted {len(emb_candidates)} embedding candidates")
-
             except Exception as e:
                 logger.warning(f"Embedding extraction failed: {e}")
 
         logger.info(f"Total candidates extracted: {len(all_candidates)}")
         return all_candidates
 
-    def _get_pseudo_relevant_docs(
+    def _perform_lucene_search(self, query: str, n: int):
+        """
+        Centralized helper to perform Lucene search and return top docs.
+        Returns Tuple(TopDocs, score_docs).
+        """
+        try:
+            query_parser = self.QueryParser(self.field_name, self.analyzer)
+            lucene_query = query_parser.parse(query)
+            top_docs = self.lucene_searcher.search(lucene_query, n)
+            return top_docs
+        except Exception as e:
+            logger.warning(f"Lucene search failed for query '{query}': {e}")
+            return None
+
+    def _get_pseudo_relevant_docs_and_tokens(
             self,
             query: str,
             n: int = 10
-    ) -> List[str]:
+    ) -> Tuple[List[str], List[List[str]]]:
         """
-        Get top-n pseudo-relevant documents using BM25.
-
-        Args:
-            query: Query string
-            n: Number of documents to retrieve
-
-        Returns:
-            List of document texts
+        Get pseudo-relevant docs AND their tokenized versions.
+        Optimized to do retrieval once.
         """
-        try:
-            # Parse query
-            query_parser = self.QueryParser(self.field_name, self.analyzer)
-            lucene_query = query_parser.parse(query)
+        docs_text = []
+        docs_tokens = []
 
-            # Search
-            top_docs = self.lucene_searcher.search(lucene_query, n)
+        top_docs = self._perform_lucene_search(query, n)
+        if top_docs is None:
+            return [], []
 
-            # Extract document texts
-            docs = []
-            for score_doc in top_docs.scoreDocs:
+        for score_doc in top_docs.scoreDocs:
+            try:
                 doc = self.lucene_searcher.storedFields().document(score_doc.doc)
                 doc_text = doc.get(self.field_name)
                 if doc_text:
-                    docs.append(doc_text)
+                    docs_text.append(doc_text)
+                    # Simple tokenization for stats calculation
+                    # (lowercasing done here to save time in loop)
+                    docs_tokens.append(doc_text.lower().split())
+            except Exception as e:
+                continue
 
-            logger.debug(f"Retrieved {len(docs)} pseudo-relevant documents")
-            return docs
-
-        except Exception as e:
-            logger.warning(f"Failed to retrieve pseudo-relevant docs: {e}")
-            return []
+        return docs_text, docs_tokens
 
     def _get_term_stats(self, term: str) -> Tuple[int, int]:
         """
         Get document frequency (DF) and collection frequency (CF) for a term.
-
-        Args:
-            term: Term string
-
-        Returns:
-            Tuple of (df, cf)
+        Includes robust UTF-8 handling for JNI.
         """
+        if not term or not isinstance(term, str):
+            return 1, 1
+
         try:
             # Get terms for the field
             terms = self.lucene_reader.terms(self.field_name)
@@ -366,8 +339,14 @@ class MultiSourceCandidateExtractor:
             # Get term iterator
             terms_enum = terms.iterator()
 
-            # Create BytesRef for the term
-            term_bytes = self.BytesRef(term.lower().encode('utf-8'))
+            # SAFELY Create BytesRef
+            try:
+                # Ensure clean UTF-8 encoding
+                term_encoded = term.strip().lower().encode('utf-8')
+                term_bytes = self.BytesRef(term_encoded)
+            except Exception as e:
+                logger.debug(f"Failed to encode term '{term}' for Lucene lookup: {e}")
+                return 1, 1
 
             # Seek to term
             if terms_enum.seekExact(term_bytes):
@@ -379,81 +358,63 @@ class MultiSourceCandidateExtractor:
             return 1, 1
 
         except Exception as e:
+            # Fallback for weird JNI errors or index issues
+            # Don't log error on every miss to avoid log spam, use debug
             logger.debug(f"Error getting stats for term '{term}': {e}")
             return 1, 1
 
-    def _compute_tf_pseudo(
+    def _compute_tf_pseudo_optimized(
             self,
             term: str,
-            pseudo_docs: List[str]
+            pseudo_docs_tokens: List[List[str]]
     ) -> float:
         """
-        Compute normalized term frequency in pseudo-relevant documents.
-
-        Args:
-            term: Term string
-            pseudo_docs: List of document texts
-
-        Returns:
-            Normalized TF (term count / total words)
+        Compute normalized term frequency using pre-tokenized docs.
         """
-        if not pseudo_docs:
+        if not pseudo_docs_tokens:
             return 0.0
 
         term_lower = term.lower()
         total_count = 0
         total_words = 0
 
-        for doc in pseudo_docs:
-            # Simple whitespace tokenization
-            doc_words = doc.lower().split()
-            total_words += len(doc_words)
-
-            # Count term occurrences
-            total_count += doc_words.count(term_lower)
+        for doc_tokens in pseudo_docs_tokens:
+            total_words += len(doc_tokens)
+            total_count += doc_tokens.count(term_lower)
 
         if total_words == 0:
             return 0.0
 
         return total_count / total_words
 
-    def _compute_coverage(
+    def _compute_coverage_optimized(
             self,
             term: str,
-            pseudo_docs: List[str]
+            pseudo_docs_text: List[str]
     ) -> float:
         """
         Compute fraction of pseudo-docs containing the term.
-
-        Args:
-            term: Term string
-            pseudo_docs: List of document texts
-
-        Returns:
-            Coverage fraction [0, 1]
         """
-        if not pseudo_docs:
+        if not pseudo_docs_text:
             return 0.0
 
         term_lower = term.lower()
-        count = sum(1 for doc in pseudo_docs if term_lower in doc.lower())
+        # Fast string check
+        count = sum(1 for doc in pseudo_docs_text if term_lower in doc.lower())
 
-        return count / len(pseudo_docs)
+        return count / len(pseudo_docs_text)
 
-    def compute_pseudo_centroid(self, query_text: str) -> np.ndarray:
+    def compute_pseudo_centroid(self, query_text: str, precomputed_docs: Optional[List[str]] = None) -> np.ndarray:
         """
         Compute centroid of pseudo-relevant document embeddings.
-
-        Args:
-            query_text: Query string
-
-        Returns:
-            Centroid embedding (d,)
+        Accepts precomputed docs to avoid re-searching Lucene.
         """
-        pseudo_docs = self._get_pseudo_relevant_docs(query_text, self.n_pseudo_docs)
+        if precomputed_docs is not None:
+            pseudo_docs = precomputed_docs
+        else:
+            pseudo_docs, _ = self._get_pseudo_relevant_docs_and_tokens(query_text, self.n_pseudo_docs)
 
         if not pseudo_docs:
-            # No pseudo-docs, return zero vector
             return np.zeros(self.encoder.get_dim(), dtype=np.float32)
 
         # Encode documents
@@ -464,25 +425,17 @@ class MultiSourceCandidateExtractor:
 
         return centroid
 
-    def compute_query_stats(self, query_text: str) -> Dict[str, float]:
+    def compute_query_stats(
+            self,
+            query_text: str,
+            precomputed_scores: Optional[np.ndarray] = None
+    ) -> Dict[str, float]:
         """
         Compute query-level statistics for budget prediction.
 
-        Returns dict with:
-          - clarity: Query clarity score
-          - entropy: Entropy over pseudo-doc scores
-          - avg_idf: Average IDF of query terms
-          - max_idf: Maximum IDF of query terms
-          - avg_bm25: Average BM25 score of pseudo-docs
-          - var_bm25: Variance of BM25 scores
-          - q_len: Query length (number of terms)
-          - q_type: Query type ("navigational", "informational", "transactional")
-
         Args:
-            query_text: Query string
-
-        Returns:
-            Dictionary of query statistics
+            query_text: The query
+            precomputed_scores: Optional numpy array of top BM25 scores if already retrieved.
         """
         # Tokenize query
         query_tokens = query_text.lower().split()
@@ -501,11 +454,18 @@ class MultiSourceCandidateExtractor:
         # === CLARITY ===
         clarity = self._compute_query_clarity(query_text, query_tokens)
 
-        # === ENTROPY (over pseudo-doc retrieval scores) ===
-        entropy = self._compute_retrieval_entropy(query_text)
+        # === RETRIEVAL STATS (Shared Search) ===
+        # If scores aren't provided, perform ONE search here to get them
+        if precomputed_scores is None:
+            top_docs = self._perform_lucene_search(query_text, self.n_pseudo_docs)
+            if top_docs and top_docs.scoreDocs:
+                precomputed_scores = np.array([sd.score for sd in top_docs.scoreDocs])
+            else:
+                precomputed_scores = np.array([])
 
-        # === BM25 STATISTICS ===
-        avg_bm25, var_bm25 = self._compute_bm25_stats(query_text)
+        # === ENTROPY & BM25 STATS ===
+        entropy = self._compute_retrieval_entropy_from_scores(precomputed_scores)
+        avg_bm25, var_bm25 = self._compute_bm25_stats_from_scores(precomputed_scores)
 
         # === QUERY TYPE ===
         q_type = self._classify_query_type(query_text)
@@ -528,28 +488,18 @@ class MultiSourceCandidateExtractor:
     ) -> float:
         """
         Compute query clarity score.
-
         Clarity = sum_t P(t|q) * log(P(t|q) / P(t|C))
-
-        Simplified version using query terms and their collection frequencies.
-
-        Args:
-            query: Query string
-            query_tokens: List of query tokens
-
-        Returns:
-            Clarity score
         """
         if not query_tokens:
             return 0.0
 
         clarity = 0.0
-
         for token in query_tokens:
             df, cf = self._get_term_stats(token)
 
             # P(t|C) = collection frequency / collection size
-            p_t_c = cf / (self.collection_size * 100)  # Assume avg doc length ~100
+            # Assume avg doc length ~100 for normalization if strict count isn't available
+            p_t_c = cf / (self.collection_size * 100)
 
             # P(t|q) = uniform over query terms
             p_t_q = 1.0 / len(query_tokens)
@@ -559,123 +509,71 @@ class MultiSourceCandidateExtractor:
 
         return float(clarity)
 
-    def _compute_retrieval_entropy(self, query: str) -> float:
+    def _compute_retrieval_entropy_from_scores(self, scores: np.ndarray) -> float:
         """
-        Compute entropy over pseudo-relevant document scores.
-
-        High entropy = diverse/ambiguous results
-        Low entropy = concentrated/clear results
-
-        Args:
-            query: Query string
-
-        Returns:
-            Entropy value
+        Compute entropy from pre-computed scores to avoid re-searching.
         """
-        try:
-            # Parse and search
-            query_parser = self.QueryParser(self.field_name, self.analyzer)
-            lucene_query = query_parser.parse(query)
-            top_docs = self.lucene_searcher.search(lucene_query, self.n_pseudo_docs)
-
-            if not top_docs.scoreDocs:
-                return 0.0
-
-            # Get scores
-            scores = np.array([sd.score for sd in top_docs.scoreDocs])
-
-            # Normalize to probabilities
-            if scores.sum() == 0:
-                return 0.0
-
-            probs = scores / scores.sum()
-
-            # Compute entropy
-            entropy = -np.sum(probs * np.log(probs + 1e-12))
-
-            return float(entropy)
-
-        except Exception as e:
-            logger.debug(f"Failed to compute retrieval entropy: {e}")
+        if scores.size == 0 or scores.sum() == 0:
             return 0.0
 
-    def _compute_bm25_stats(self, query: str) -> Tuple[float, float]:
+        # Normalize to probabilities
+        probs = scores / scores.sum()
+
+        # Compute entropy
+        entropy = -np.sum(probs * np.log(probs + 1e-12))
+        return float(entropy)
+
+    def _compute_bm25_stats_from_scores(self, scores: np.ndarray) -> Tuple[float, float]:
         """
-        Compute BM25 statistics from pseudo-relevant documents.
-
-        Args:
-            query: Query string
-
-        Returns:
-            Tuple of (avg_bm25, var_bm25)
+        Compute BM25 stats from pre-computed scores.
         """
-        try:
-            # Parse and search
-            query_parser = self.QueryParser(self.field_name, self.analyzer)
-            lucene_query = query_parser.parse(query)
-            top_docs = self.lucene_searcher.search(lucene_query, self.n_pseudo_docs)
-
-            if not top_docs.scoreDocs:
-                return 0.0, 0.0
-
-            # Get scores
-            scores = np.array([sd.score for sd in top_docs.scoreDocs])
-
-            avg_bm25 = float(np.mean(scores))
-            var_bm25 = float(np.var(scores))
-
-            return avg_bm25, var_bm25
-
-        except Exception as e:
-            logger.debug(f"Failed to compute BM25 stats: {e}")
+        if scores.size == 0:
             return 0.0, 0.0
+
+        avg_bm25 = float(np.mean(scores))
+        var_bm25 = float(np.var(scores))
+        return avg_bm25, var_bm25
 
     def _classify_query_type(self, query: str) -> str:
         """
-        Classify query type using heuristics.
+        Classify query type using Regex-based heuristics (Robust).
 
         Returns: "navigational", "informational", or "transactional"
-
-        Heuristics:
-          - Navigational: homepage, website, official, login, site
-          - Transactional: buy, purchase, price, download, order, shop, cheap
-          - Informational: what, how, why, who, when, where, definition
-          - Default: informational
-
-        Args:
-            query: Query string
-
-        Returns:
-            Query type string
         """
         query_lower = query.lower()
+
+        def has_word(keywords, text):
+            # Creates regex like: \b(buy|purchase|price)\b
+            pattern = r'\b(' + '|'.join([re.escape(k) for k in keywords]) + r')\b'
+            return bool(re.search(pattern, text))
 
         # Navigational indicators
         nav_keywords = [
             'homepage', 'website', 'official', 'login', 'site',
-            'main page', 'home page', 'portal'
+            'main page', 'home page', 'portal', 'www', '.com', '.org'
         ]
-        if any(kw in query_lower for kw in nav_keywords):
+        if has_word(nav_keywords, query_lower):
             return "navigational"
 
         # Transactional indicators
         trans_keywords = [
             'buy', 'purchase', 'price', 'download', 'order', 'shop',
             'cheap', 'deal', 'discount', 'sale', 'cost', 'rent',
-            'book', 'reserve', 'subscribe'
+            'book', 'reserve', 'subscribe', 'coupon', 'review'
         ]
-        if any(kw in query_lower for kw in trans_keywords):
+        if has_word(trans_keywords, query_lower):
             return "transactional"
 
-        # Informational indicators (explicit)
+        # Informational indicators
         info_keywords = [
             'what', 'how', 'why', 'who', 'when', 'where',
-            'definition', 'explain', 'guide', 'tutorial', 'learn'
+            'definition', 'explain', 'guide', 'tutorial', 'learn',
+            'meaning', 'example', 'history', 'difference', 'vs'
         ]
-        if any(kw in query_lower for kw in info_keywords):
+        if has_word(info_keywords, query_lower):
             return "informational"
 
-        # Default: informational
+        # Default fallback
         return "informational"
 
     def __del__(self):
@@ -692,73 +590,29 @@ class MultiSourceCandidateExtractor:
 # ---------------------------------------------------------------------------
 
 def _main_cli():
-    """
-    CLI for testing candidate extraction.
-
-    Example:
-        python -m msmeqe.expansion.candidate_extraction_pipeline \\
-            --index-path data/msmarco_index \\
-            --query "neural networks machine learning"
-    """
     import argparse
 
-    parser = argparse.ArgumentParser(
-        description="Test multi-source candidate extraction"
-    )
-    parser.add_argument(
-        "--index-path",
-        type=str,
-        required=True,
-        help="Path to Lucene index",
-    )
-    parser.add_argument(
-        "--query",
-        type=str,
-        required=True,
-        help="Query text",
-    )
-    parser.add_argument(
-        "--kb-wat-output",
-        type=str,
-        default=None,
-        help="Path to WAT entity linking output (optional)",
-    )
-    parser.add_argument(
-        "--vocab-embeddings",
-        type=str,
-        default=None,
-        help="Path to vocabulary embeddings (optional)",
-    )
+    parser = argparse.ArgumentParser(description="Test multi-source candidate extraction")
+    parser.add_argument("--index-path", type=str, required=True)
+    parser.add_argument("--query", type=str, required=True)
+    parser.add_argument("--kb-wat-output", type=str, default=None)
+    parser.add_argument("--vocab-embeddings", type=str, default=None)
 
     args = parser.parse_args()
 
-    logging.basicConfig(
-        level=logging.INFO,
-        format="[%(asctime)s] %(levelname)s %(name)s: %(message)s",
-    )
+    logging.basicConfig(level=logging.INFO)
 
-    # Initialize encoder
     logger.info("Initializing encoder...")
     encoder = SemanticEncoder(model_name="sentence-transformers/all-MiniLM-L6-v2")
 
-    # Initialize KB extractor (optional)
     kb_extractor = None
     if args.kb_wat_output:
-        logger.info("Initializing KB extractor...")
-        kb_extractor = KBCandidateExtractor(
-            wat_output_path=args.kb_wat_output,
-        )
+        kb_extractor = KBCandidateExtractor(wat_output_path=args.kb_wat_output)
 
-    # Initialize embedding extractor (optional)
     emb_extractor = None
     if args.vocab_embeddings:
-        logger.info("Initializing embedding extractor...")
-        emb_extractor = EmbeddingCandidateExtractor(
-            encoder=encoder,
-            vocab_path=args.vocab_embeddings,
-        )
+        emb_extractor = EmbeddingCandidateExtractor(encoder=encoder, vocab_path=args.vocab_embeddings)
 
-    # Initialize extractor
     logger.info("Initializing candidate extractor...")
     extractor = MultiSourceCandidateExtractor(
         index_path=args.index_path,
@@ -767,51 +621,17 @@ def _main_cli():
         emb_extractor=emb_extractor,
     )
 
-    # Extract candidates
     logger.info(f"Extracting candidates for: {args.query}")
-    candidates = extractor.extract_all_candidates(
-        query_text=args.query,
-    )
+    candidates = extractor.extract_all_candidates(query_text=args.query)
 
-    # Print results
     print(f"\nQuery: {args.query}")
     print(f"Total candidates: {len(candidates)}")
-    print("\n" + "=" * 80)
 
-    # Group by source
-    from collections import defaultdict
-    by_source = defaultdict(list)
-    for cand in candidates:
-        by_source[cand.source].append(cand)
-
-    for source in ["docs", "kb", "emb"]:
-        if source in by_source:
-            print(f"\n{source.upper()} SOURCE ({len(by_source[source])} candidates):")
-            print("-" * 80)
-            for i, cand in enumerate(by_source[source][:10], 1):
-                print(f"{i:2d}. {cand.term:30s} "
-                      f"score={cand.native_score:.4f} "
-                      f"df={cand.df:6d} "
-                      f"rm3={cand.rm3_score:.4f}")
-
-    # Compute query stats
-    print("\n" + "=" * 80)
-    print("QUERY STATISTICS:")
-    print("-" * 80)
-    query_stats = extractor.compute_query_stats(args.query)
-    for key, value in query_stats.items():
-        if isinstance(value, float):
-            print(f"  {key:15s}: {value:.4f}")
-        else:
-            print(f"  {key:15s}: {value}")
-
-    # Compute pseudo-centroid
-    print("\n" + "=" * 80)
-    print("PSEUDO-DOCUMENT CENTROID:")
-    print("-" * 80)
-    centroid = extractor.compute_pseudo_centroid(args.query)
-    print(f"  Shape: {centroid.shape}")
-    print(f"  Norm:  {np.linalg.norm(centroid):.4f}")
+    # Compute query stats (testing shared retrieval logic internally)
+    print("\nQUERY STATISTICS:")
+    stats = extractor.compute_query_stats(args.query)
+    for k, v in stats.items():
+        print(f"  {k}: {v}")
 
 
 if __name__ == "__main__":

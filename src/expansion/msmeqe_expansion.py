@@ -28,8 +28,8 @@ from typing import List, Dict, Optional, Tuple
 
 import numpy as np
 
-from msmeqe.reranking.semantic_encoder import SemanticEncoder
-from msmeqe.features.feature_extraction import FeatureExtractor, create_candidate_stats_dict
+from src.reranking.semantic_encoder import SemanticEncoder
+from src.features.feature_extraction import FeatureExtractor, create_candidate_stats_dict
 
 logger = logging.getLogger(__name__)
 
@@ -137,10 +137,10 @@ class MSMEQEExpansionModel:
     def __init__(
             self,
             encoder: SemanticEncoder,
-            feature_extractor: FeatureExtractor,
             value_model,
             weight_model,
             budget_model,
+            collection_size: int,
             lambda_interp: float = 0.3,
             min_budget: int = 20,
             max_budget: int = 80,
@@ -157,7 +157,7 @@ class MSMEQEExpansionModel:
             min_budget, max_budget, budget_step: budget range & discretization
         """
         self.encoder = encoder
-        self.feature_extractor = feature_extractor
+        self.feature_extractor = FeatureExtractor(collection_size=collection_size)
         self.value_model = value_model
         self.weight_model = weight_model
         self.budget_model = budget_model

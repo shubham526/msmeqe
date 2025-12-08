@@ -42,35 +42,9 @@ from collections import defaultdict
 import numpy as np
 from tqdm import tqdm
 import joblib
+from src.utils.lucene_utils import initialize_lucene
 
 logger = logging.getLogger(__name__)
-
-
-# ---------------------------------------------------------------------------
-# Lucene initialization
-# ---------------------------------------------------------------------------
-
-def initialize_lucene(lucene_path: str) -> bool:
-    """Initialize Lucene JVM."""
-    try:
-        import lucene
-
-        try:
-            if lucene.getVMEnv():
-                logger.info("Lucene JVM already initialized")
-                return True
-        except Exception:
-            pass
-
-        logger.info(f"Initializing Lucene JVM: {lucene_path}")
-        lucene.initVM(classpath=lucene_path, vmargs=['-Djava.awt.headless=true'])
-        logger.info("Lucene JVM initialized successfully")
-        return True
-
-    except Exception as e:
-        logger.error(f"Failed to initialize Lucene: {e}")
-        return False
-
 
 # ---------------------------------------------------------------------------
 # Data loading
@@ -248,12 +222,18 @@ class DenseRetriever:
         self.index_path = index_path
 
         # Load pre-computed document embeddings
-        doc_emb_path = Path(index_path).parent / "doc_embeddings.npy"
-        doc_ids_path = Path(index_path).parent / "doc_ids.json"
+        # Handle cases where index_path is file or directory
+        base_path = Path(index_path)
+        if base_path.is_file():
+            base_path = base_path.parent
 
+        doc_emb_path = base_path / "doc_embeddings.npy"
+        doc_ids_path = base_path / "doc_ids.json"
+
+        # Try parent if not found
         if not doc_emb_path.exists():
-            doc_emb_path = Path(index_path) / "doc_embeddings.npy"
-            doc_ids_path = Path(index_path) / "doc_ids.json"
+            doc_emb_path = base_path.parent / "doc_embeddings.npy"
+            doc_ids_path = base_path.parent / "doc_ids.json"
 
         if not doc_emb_path.exists():
             raise FileNotFoundError(
@@ -381,7 +361,7 @@ class MSMEQEEvaluationPipeline:
                 candidates = self.candidate_extractor.extract_all_candidates(
                     query_text=qtext,
                     query_id=qid,
-                    kb_override=kb_override,  # ← ADD THIS LINE
+                    kb_override=kb_override,
                 )
 
                 if not candidates:
@@ -427,7 +407,6 @@ class MSMEQEEvaluationPipeline:
                     'num_selected_terms': len(selected_terms),
                     'total_term_count': total_count,
                     'selected_by_source': dict(selected_source_counts),
-                    # Removed 'budget' - not available in query_stats
                     'clarity': float(query_stats.get('clarity', 0)),
                     'entropy': float(query_stats.get('entropy', 0)),
                     'q_type': query_stats.get('q_type', 'unknown'),
@@ -447,9 +426,6 @@ class MSMEQEEvaluationPipeline:
 
             except Exception as e:
                 logger.error(f"Failed to process query {qid}: {e}")
-                import traceback
-                logger.debug(traceback.format_exc())
-
                 # Fall back to original query
                 q_emb = self.encoder.encode([qtext])[0]
                 results = self.dense_retriever.retrieve(q_emb, k=topk)
@@ -496,6 +472,18 @@ class MSMEQEEvaluationPipeline:
 
 
 # ---------------------------------------------------------------------------
+# Helper Class for Ablations
+# ---------------------------------------------------------------------------
+
+class FixedBudgetModel:
+    """Mock model for Fixed Budget ablation."""
+
+    def predict(self, X):
+        # Always return budget 50
+        return np.array([50] * X.shape[0])
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -531,7 +519,7 @@ def main():
 
     # === KB COMPONENT ===
     parser.add_argument("--kb-candidates", type=str, default=None,
-                        help="Path to precomputed KB candidates JSONL")
+                        help="Path to precomputed KB candidates JSONL (OVERRIDES dynamic extraction)")
     parser.add_argument("--kb-wat-output", type=str, default=None,
                         help="Path to WAT output (alternative to --kb-candidates)")
 
@@ -553,6 +541,11 @@ def main():
     # === OUTPUT ===
     parser.add_argument("--output", type=str, required=True,
                         help="Output TREC run file path")
+
+    # === ABLATION STUDY ===
+    parser.add_argument("--ablation", type=str,
+                        choices=['no_kb', 'no_emb', 'fixed_budget'],
+                        help="Run ablation study configuration")
 
     # === MISC / ANALYSIS ===
     parser.add_argument("--save-features", type=str, default=None,
@@ -585,6 +578,9 @@ def main():
     logger.info(f"Output:      {args.output}")
     logger.info(f"Run name:    {args.run_name}")
 
+    if args.ablation:
+        logger.info(f"ABLATION MODE: {args.ablation}")
+
     # Initialize Lucene
     if not initialize_lucene(args.lucene_path):
         logger.error("Failed to initialize Lucene")
@@ -612,24 +608,51 @@ def main():
 
     # Load trained models
     logger.info("Loading trained models...")
-    value_model = joblib.load(args.value_model)
-    weight_model = joblib.load(args.weight_model)
-    budget_model = joblib.load(args.budget_model)
+    try:
+        value_model = joblib.load(args.value_model)
+        weight_model = joblib.load(args.weight_model)
+
+        # Ablation: Fixed Budget
+        if args.ablation == 'fixed_budget':
+            logger.info("ABLATION: Overriding Budget Model with Fixed Budget (50)")
+            budget_model = FixedBudgetModel()
+        else:
+            budget_model = joblib.load(args.budget_model)
+
+        # Validation
+        if not (value_model and weight_model and budget_model):
+            raise ValueError("One or more models failed to load properly.")
+
+    except Exception as e:
+        logger.error(f"Failed to load models: {e}")
+        sys.exit(1)
 
     # Initialize KB extractor
     kb_extractor = None
     if args.kb_wat_output:
-        logger.info("Initializing KB extractor...")
-        kb_extractor = KBCandidateExtractor(wat_output_path=args.kb_wat_output)
+        # Ablation: No KB
+        if args.ablation == 'no_kb':
+            logger.info("ABLATION: Disabling KB Extractor")
+            kb_extractor = None
+            # Also clear any precomputed map to be safe
+            kb_candidates_map = None
+        else:
+            logger.info("Initializing KB extractor...")
+            kb_extractor = KBCandidateExtractor(wat_output_path=args.kb_wat_output)
 
     # Initialize embedding extractor
     emb_extractor = None
     if args.emb_vocab:
-        logger.info("Initializing embedding extractor...")
-        emb_extractor = EmbeddingCandidateExtractor(
-            encoder=encoder,
-            vocab_path=args.emb_vocab,
-        )
+        # Ablation: No Embeddings
+        if args.ablation == 'no_emb':
+            logger.info("ABLATION: Disabling Embedding Extractor")
+            emb_extractor = None
+        else:
+            logger.info("Initializing embedding extractor...")
+            emb_extractor = EmbeddingCandidateExtractor(
+                encoder=encoder,
+                vocab_path=args.emb_vocab,
+            )
 
     # Initialize candidate extractor
     logger.info("Initializing candidate extractor...")
@@ -642,7 +665,8 @@ def main():
         n_pseudo_docs=args.rm3_depth,
     )
 
-    # Initialize MS-MEQE model (CORRECTED: no feature_extractor, needs collection_size)
+    # Initialize MS-MEQE model
+    # Note: feature_extractor is internal to MSMEQEExpansionModel
     logger.info("Initializing MS-MEQE model...")
     msmeqe_model = MSMEQEExpansionModel(
         encoder=encoder,
@@ -669,7 +693,7 @@ def main():
         metrics=['map', 'ndcg_cut_10', 'recip_rank', 'recall_100', 'recall_1000', 'P_10']
     )
 
-    # Create evaluation pipeline (CORRECTED: no feature_extractor)
+    # Create evaluation pipeline
     pipeline = MSMEQEEvaluationPipeline(
         encoder=encoder,
         candidate_extractor=candidate_extractor,
