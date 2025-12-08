@@ -82,6 +82,7 @@ class FeatureExtractor:
         if enable_wordnet:
             try:
                 import nltk
+                nltk.download('wordnet', quiet=True)
                 from nltk.corpus import wordnet
                 # Test if WordNet is available
                 wordnet.synsets('test')
